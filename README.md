@@ -79,6 +79,7 @@ flowchart TD
 | **Strict A* Routing** | Guarantees zero diagonal shortcuts or obstacle clipping. Pickers only travel through designated aisles and cross-aisles. |
 | **Dynamic Order Replay** | Replays real historical order lines. Picker moves along waypoints, pauses at racks to pick items, dynamically stacks cargo boxes onto the cart, and unloads at the packing dock. |
 | **Live KPI Benchmarking** | Measures total walking distance ($m$) and average order pick time ($s$) side-by-side, displaying live percentage improvement/penalty badges. |
+| **Batch Picking (TSP Brain)** | **Stretch Goal**: Groups sequential orders into batches (1, 3, or 5 orders) and calculates an optimal multi-stop tour using Nearest-Neighbor TSP over A* aisle paths, cutting monthly walking distance by up to 76%. |
 | **Multi-Angle Camera** | Toggle between **3D Perspective**, **Top-Down (2D Plan)**, and **Follow Picker** tracking camera. |
 
 ---

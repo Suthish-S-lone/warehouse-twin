@@ -10,7 +10,7 @@ const GRID_W = 22; // X: 0 to 21
 const GRID_H = 16; // Y: 0 to 15
 const CELL_SIZE = 1.6; // Meters per grid cell
 const DOCK_COORD = { x: 10, y: 1 }; // Front center packing dock node
-const PICKER_SPEED = 3.2; // Virtual m/s for picker animation
+const PICKER_SPEED = 3.6; // Virtual m/s base speed for picker movement
 const ITEM_PICK_TIME = 4.0; // Seconds to pick an item at rack
 const HUMAN_WALK_SPEED = 1.2; // Real-world human picker walking speed (m/s)
 
@@ -42,24 +42,22 @@ const generateWarehouseSlots = () => {
 
   let id = 0;
   for (const bay of bays) {
-    // Left column of the bay
     for (let gy = 3; gy <= 12; gy++) {
       slots.push({
         slotId: id++,
         rackX: bay.leftCol,
         rackY: gy,
-        pickX: bay.leftAisle, // Picker stands in left aisle
+        pickX: bay.leftAisle,
         pickY: gy,
         bayName: `Bay ${bay.leftCol / 4 | 0}-L`,
       });
     }
-    // Right column of the bay
     for (let gy = 3; gy <= 12; gy++) {
       slots.push({
         slotId: id++,
         rackX: bay.rightCol,
         rackY: gy,
-        pickX: bay.rightAisle, // Picker stands in right aisle
+        pickX: bay.rightAisle,
         pickY: gy,
         bayName: `Bay ${bay.leftCol / 4 | 0}-R`,
       });
@@ -132,10 +130,7 @@ function findAStarPath(start, goal) {
       const nx = currCoord.x + dx;
       const ny = currCoord.y + dy;
 
-      // Ensure inside grid boundaries
       if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) continue;
-
-      // Obstacle check: RACKS CANNOT BE WALKED THROUGH
       if (isRackCell(nx, ny)) continue;
 
       const neighborKey = key(nx, ny);
@@ -153,11 +148,9 @@ function findAStarPath(start, goal) {
     }
   }
 
-  // Fallback direct path if enclosed
   return [{ x: start.x, y: start.y }, { x: goal.x, y: goal.y }];
 }
 
-// Distance cache to avoid redundant path calculations during simulation scoring
 const pathCache = new Map();
 function getCachedDistance(p1, p2) {
   const k1 = `${p1.x},${p1.y}->${p2.x},${p2.y}`;
@@ -168,45 +161,127 @@ function getCachedDistance(p1, p2) {
   return distMeters;
 }
 
-// Color coding according to pick frequency / velocity
 function getVelocityColor(rank) {
-  if (rank <= 15) return '#ef4444'; // Top velocity: High-heat Red
-  if (rank <= 35) return '#f97316'; // High velocity: Orange
-  if (rank <= 60) return '#eab308'; // Medium velocity: Amber/Yellow
-  if (rank <= 85) return '#10b981'; // Moderate: Emerald
-  return '#3b82f6'; // Low velocity: Cool Blue
+  if (rank <= 15) return '#ef4444';
+  if (rank <= 35) return '#f97316';
+  if (rank <= 60) return '#eab308';
+  if (rank <= 85) return '#10b981';
+  return '#3b82f6';
 }
 
 // ==========================================
-// 3. 3D COMPONENTS (R3F)
+// 3. BATCH ROUTING ENGINE: NEAREST-NEIGHBOR TSP
+// ==========================================
+function solveNearestNeighborTSP(startNode, stops, getDistance) {
+  if (stops.length <= 1) return stops;
+
+  const unvisited = [...stops];
+  const route = [];
+  let current = startNode;
+
+  while (unvisited.length > 0) {
+    let nearestIdx = 0;
+    let nearestDist = Infinity;
+
+    for (let i = 0; i < unvisited.length; i++) {
+      const candidate = unvisited[i];
+      const dist = getDistance(current, { x: candidate.pickX, y: candidate.pickY });
+      if (dist < nearestDist) {
+        nearestDist = dist;
+        nearestIdx = i;
+      }
+    }
+
+    const nextStop = unvisited.splice(nearestIdx, 1)[0];
+    route.push(nextStop);
+    current = { x: nextStop.pickX, y: nextStop.pickY };
+  }
+
+  return route;
+}
+
+function calculateFullMonthMetrics(allOrders, prodToSlot, slots, batchSize, getDistance) {
+  if (!allOrders || allOrders.length === 0) {
+    return { distanceM: 0, distanceKm: '0.0', timeSec: 0, timeHours: '0.0', tripsCount: 0, totalLines: 0 };
+  }
+
+  let totalDistance = 0;
+  let totalLines = 0;
+  const numOrders = allOrders.length;
+  const tripsCount = Math.ceil(numOrders / batchSize);
+
+  for (let i = 0; i < numOrders; i += batchSize) {
+    const batch = allOrders.slice(i, i + batchSize);
+    const uniqueSlotMap = new Map();
+
+    for (const ord of batch) {
+      totalLines += ord.lines.length;
+      for (const line of ord.lines) {
+        const sId = prodToSlot.get(line.stock_code);
+        if (sId !== undefined && !uniqueSlotMap.has(sId)) {
+          const slot = slots[sId];
+          if (slot) uniqueSlotMap.set(sId, slot);
+        }
+      }
+    }
+
+    const stops = Array.from(uniqueSlotMap.values());
+    if (batchSize === 1) {
+      let curr = DOCK_COORD;
+      for (const stop of stops) {
+        totalDistance += getDistance(curr, { x: stop.pickX, y: stop.pickY });
+        curr = { x: stop.pickX, y: stop.pickY };
+      }
+      totalDistance += getDistance(curr, DOCK_COORD);
+    } else {
+      const tspRoute = solveNearestNeighborTSP(DOCK_COORD, stops, getDistance);
+      let curr = DOCK_COORD;
+      for (const stop of tspRoute) {
+        totalDistance += getDistance(curr, { x: stop.pickX, y: stop.pickY });
+        curr = { x: stop.pickX, y: stop.pickY };
+      }
+      totalDistance += getDistance(curr, DOCK_COORD);
+    }
+  }
+
+  const walkingTimeSec = totalDistance / HUMAN_WALK_SPEED;
+  const pickingTimeSec = totalLines * ITEM_PICK_TIME;
+  const totalTimeSec = walkingTimeSec + pickingTimeSec;
+
+  return {
+    distanceM: totalDistance,
+    distanceKm: (totalDistance / 1000).toFixed(1),
+    timeSec: totalTimeSec,
+    timeHours: (totalTimeSec / 3600).toFixed(1),
+    tripsCount,
+    totalLines,
+  };
+}
+
+// ==========================================
+// 4. 3D COMPONENTS
 // ==========================================
 
-// Warehouse Floor with Walkable Aisles and Hazard Markings
 function WarehouseFloor() {
   const floorWidth = GRID_W * CELL_SIZE;
   const floorDepth = GRID_H * CELL_SIZE;
 
   return (
     <group position={[0, -0.01, 0]}>
-      {/* Main concrete floor slab */}
       <mesh rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
         <planeGeometry args={[floorWidth + 4, floorDepth + 4]} />
-        <meshStandardMaterial color="#0f172a" roughness={0.85} metalness={0.15} />
+        <meshStandardMaterial color="#0b1120" roughness={0.9} metalness={0.1} />
       </mesh>
-
-      {/* Grid line texture overlay */}
       <gridHelper
         args={[Math.max(floorWidth, floorDepth) + 4, Math.max(GRID_W, GRID_H) + 2, '#334155', '#1e293b']}
         position={[0, 0.01, 0]}
       />
-
-      {/* Cross-Aisle Safety Guide Lines */}
-      {/* Front cross-aisle at Y=2 */}
+      {/* Front cross-aisle */}
       <mesh position={[0, 0.02, (2 - GRID_H / 2 + 0.5) * CELL_SIZE]} rotation={[-Math.PI / 2, 0, 0]}>
         <planeGeometry args={[floorWidth - 2, 0.15]} />
         <meshBasicMaterial color="#eab308" transparent opacity={0.6} />
       </mesh>
-      {/* Back cross-aisle at Y=13 */}
+      {/* Back cross-aisle */}
       <mesh position={[0, 0.02, (13 - GRID_H / 2 + 0.5) * CELL_SIZE]} rotation={[-Math.PI / 2, 0, 0]}>
         <planeGeometry args={[floorWidth - 2, 0.15]} />
         <meshBasicMaterial color="#eab308" transparent opacity={0.6} />
@@ -215,7 +290,6 @@ function WarehouseFloor() {
   );
 }
 
-// Packing & Shipping Dock
 function PackingDock() {
   const [dx, dz] = [
     (DOCK_COORD.x - GRID_W / 2 + 0.5) * CELL_SIZE,
@@ -224,7 +298,6 @@ function PackingDock() {
 
   return (
     <group position={[dx, 0, dz - 1.2]}>
-      {/* Hazard striped floor zone */}
       <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.01, 0]}>
         <planeGeometry args={[4.8, 2.2]} />
         <meshStandardMaterial color="#1e293b" />
@@ -233,26 +306,18 @@ function PackingDock() {
         <planeGeometry args={[4.6, 2.0]} />
         <meshStandardMaterial color="#fbbf24" roughness={0.4} />
       </mesh>
-
-      {/* Packing Station Work Bench */}
       <mesh position={[0, 0.55, -0.4]} castShadow receiveShadow>
         <boxGeometry args={[3.2, 0.9, 0.9]} />
         <meshStandardMaterial color="#334155" roughness={0.5} metalness={0.5} />
       </mesh>
-
-      {/* Conveyor rollers */}
       <mesh position={[0, 0.6, 0.4]} castShadow>
         <boxGeometry args={[3.6, 0.4, 0.6]} />
         <meshStandardMaterial color="#64748b" metalness={0.8} roughness={0.3} />
       </mesh>
-
-      {/* Computer terminal screen */}
       <mesh position={[-0.8, 1.2, -0.4]} rotation={[0, 0.2, 0]}>
         <boxGeometry args={[0.5, 0.35, 0.05]} />
         <meshStandardMaterial color="#0284c7" emissive="#0284c7" emissiveIntensity={0.6} />
       </mesh>
-
-      {/* Outbound shipping boxes on conveyor */}
       <mesh position={[0.6, 0.95, 0.4]} castShadow>
         <boxGeometry args={[0.45, 0.35, 0.45]} />
         <meshStandardMaterial color="#b45309" roughness={0.9} />
@@ -261,8 +326,6 @@ function PackingDock() {
         <boxGeometry args={[0.4, 0.3, 0.4]} />
         <meshStandardMaterial color="#d97706" roughness={0.9} />
       </mesh>
-
-      {/* 3D Label */}
       <Text
         position={[0, 1.8, -0.4]}
         fontSize={0.4}
@@ -278,7 +341,6 @@ function PackingDock() {
   );
 }
 
-// Individual Storage Rack with Shelves, Colored Bins, and Hover/Selection
 function StorageRack({ slot, product, isSelected, isSwapTarget, onSelect, onHover }) {
   const [hovered, setHovered] = useState(false);
   const [wx, wy, wz] = gridToWorld(slot.rackX, slot.rackY, 0.85);
@@ -304,18 +366,14 @@ function StorageRack({ slot, product, isSelected, isSwapTarget, onSelect, onHove
         if (onHover) onHover(null, null);
       }}
     >
-      {/* Upright metal storage rack frame */}
       <mesh castShadow receiveShadow position={[0, 0, 0]}>
         <boxGeometry args={[1.0, 1.7, 1.0]} />
         <meshStandardMaterial
           color={isSelected ? '#38bdf8' : isSwapTarget ? '#a855f7' : '#1e293b'}
           roughness={0.4}
           metalness={0.7}
-          wireframe={false}
         />
       </mesh>
-
-      {/* Internal product storage bins / boxes (Top & Bottom shelves) */}
       <mesh position={[0, 0.25, 0]} castShadow>
         <boxGeometry args={[0.82, 0.42, 0.82]} />
         <meshStandardMaterial
@@ -334,16 +392,12 @@ function StorageRack({ slot, product, isSelected, isSwapTarget, onSelect, onHove
           roughness={0.4}
         />
       </mesh>
-
-      {/* Selection Glow Indicator */}
       {isSelected && (
         <mesh position={[0, 1.05, 0]}>
           <ringGeometry args={[0.3, 0.55, 32]} />
           <meshBasicMaterial color="#38bdf8" side={THREE.DoubleSide} />
         </mesh>
       )}
-
-      {/* Rank number label on top of rack */}
       {product && (
         <Text
           position={[0, 0.95, 0]}
@@ -356,8 +410,6 @@ function StorageRack({ slot, product, isSelected, isSwapTarget, onSelect, onHove
           #{product.rank}
         </Text>
       )}
-
-      {/* Floating HTML tooltip on hover */}
       {hovered && product && (
         <Html position={[0, 1.5, 0]} center distanceFactor={12}>
           <div className="bg-slate-900/95 text-white p-2.5 rounded-lg shadow-2xl border border-sky-500/50 pointer-events-none w-48 text-xs backdrop-blur-md">
@@ -384,7 +436,7 @@ function StorageRack({ slot, product, isSelected, isSwapTarget, onSelect, onHove
   );
 }
 
-// Glowing neon A* path line on the floor
+// Continuous polyline representing the full planned tour on the floor
 function ActivePathRibbon({ waypoints }) {
   const points = useMemo(() => {
     if (!waypoints || waypoints.length < 2) return [];
@@ -397,24 +449,182 @@ function ActivePathRibbon({ waypoints }) {
   if (points.length < 2) return null;
 
   const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
-
   return (
-    <primitive object={new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: '#22c55e', linewidth: 3 }))} />
+    <primitive object={new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: '#10b981', linewidth: 3 }))} />
   );
 }
 
-// Stylized Animated 3D Warehouse Picker (Cart + Operator Avatar)
-function AnimatedPicker({ currentPos, rotationAngle, carriedBoxCount }) {
+// Numbered floating markers and glowing floor rings for active batch targets
+function BatchTargetMarkers({ stops, currentSegmentIdx }) {
+  return (
+    <group>
+      {stops.map((stop) => {
+        const [wx, , wz] = gridToWorld(stop.rackX, stop.rackY, 0);
+        const isCurrent = currentSegmentIdx === stop.stopNumber - 1;
+        const isCompleted = currentSegmentIdx > stop.stopNumber - 1;
+        const ringColor = isCurrent ? '#38bdf8' : isCompleted ? '#10b981' : '#f59e0b';
+
+        return (
+          <group key={stop.slotId} position={[wx, 0, wz]}>
+            {/* Glowing Floor Ring */}
+            <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.03, 0]}>
+              <ringGeometry args={[0.55, 0.9, 32]} />
+              <meshBasicMaterial
+                color={ringColor}
+                side={THREE.DoubleSide}
+                transparent
+                opacity={isCurrent ? 0.9 : 0.45}
+              />
+            </mesh>
+
+            {/* Numbered Floating Marker Badge */}
+            <group position={[0, 2.3, 0]}>
+              <mesh>
+                <sphereGeometry args={[0.32, 16, 16]} />
+                <meshStandardMaterial
+                  color={isCurrent ? '#0284c7' : isCompleted ? '#059669' : '#d97706'}
+                  emissive={ringColor}
+                  emissiveIntensity={isCurrent ? 0.8 : 0.4}
+                />
+              </mesh>
+              <Text
+                position={[0, 0, 0.35]}
+                fontSize={0.34}
+                color="#ffffff"
+                anchorX="center"
+                anchorY="middle"
+                outlineWidth={0.03}
+                outlineColor="#0f172a"
+              >
+                {String(stop.stopNumber)}
+              </Text>
+            </group>
+          </group>
+        );
+      })}
+    </group>
+  );
+}
+
+// ==========================================
+// 5. AGV PICKER COMPONENT (USEFRAME STATE MACHINE)
+// ==========================================
+function AGVController({
+  segments,
+  currentSegmentIdx,
+  isPlaying,
+  simSpeed,
+  carriedBoxCount,
+  onSegmentComplete,
+  onTripComplete,
+  onPickAction,
+  onPositionUpdate,
+}) {
+  const groupRef = useRef();
   const beaconRef = useRef();
+
+  // State Machine Refs (avoids 60fps re-render overhead)
+  const segmentIdxRef = useRef(0);
+  const waypointIdxRef = useRef(0);
+  const progressRef = useRef(0);
+  const stateRef = useRef('DRIVING'); // 'DRIVING' | 'PICKING'
+  const pauseTimerRef = useRef(0);
+  const angleRef = useRef(0);
+
+  // Sync segment index when parent changes it or resets
+  useEffect(() => {
+    segmentIdxRef.current = currentSegmentIdx;
+    waypointIdxRef.current = 0;
+    progressRef.current = 0;
+    stateRef.current = 'DRIVING';
+  }, [currentSegmentIdx]);
 
   useFrame((_, delta) => {
     if (beaconRef.current) {
       beaconRef.current.rotation.y += delta * 8;
     }
+
+    if (!isPlaying || !segments || segments.length === 0) return;
+
+    const currentSeg = segments[segmentIdxRef.current];
+    if (!currentSeg || !currentSeg.path || currentSeg.path.length === 0) return;
+
+    // 1. PICKING PAUSE STATE
+    if (stateRef.current === 'PICKING') {
+      pauseTimerRef.current -= delta * simSpeed;
+      if (pauseTimerRef.current <= 0) {
+        // Pick pause completed! Trigger increment and transition to next segment
+        onPickAction();
+        const nextIdx = segmentIdxRef.current + 1;
+        if (nextIdx < segments.length) {
+          segmentIdxRef.current = nextIdx;
+          waypointIdxRef.current = 0;
+          progressRef.current = 0;
+          stateRef.current = 'DRIVING';
+          onSegmentComplete(nextIdx);
+        }
+      }
+      return;
+    }
+
+    // 2. DRIVING STATE
+    const path = currentSeg.path;
+    const wpIdx = waypointIdxRef.current;
+
+    // Check if reached end of current segment
+    if (wpIdx >= path.length - 1) {
+      if (currentSeg.isDock) {
+        // Return to dock segment complete! Entire trip finishes.
+        stateRef.current = 'DOCK_IDLE';
+        onTripComplete();
+      } else {
+        // Arrived at a pick rack stop! Enter PICKING pause
+        stateRef.current = 'PICKING';
+        pauseTimerRef.current = Math.max(0.12, 0.65 / Math.min(simSpeed, 8));
+      }
+      return;
+    }
+
+    // Interpolate between path[wpIdx] and path[wpIdx + 1]
+    const p0 = gridToWorld(path[wpIdx].x, path[wpIdx].y, 0);
+    const p1 = gridToWorld(path[wpIdx + 1].x, path[wpIdx + 1].y, 0);
+    const edgeDist = CELL_SIZE;
+    const stepSpeed = PICKER_SPEED * simSpeed;
+    const progressInc = (stepSpeed * delta) / edgeDist;
+
+    progressRef.current += progressInc;
+
+    if (progressRef.current >= 1.0) {
+      progressRef.current = 0;
+      waypointIdxRef.current += 1;
+    }
+
+    const t = Math.min(1.0, Math.max(0.0, progressRef.current));
+    const posX = p0[0] + (p1[0] - p0[0]) * t;
+    const posZ = p0[2] + (p1[2] - p0[2]) * t;
+
+    const dx = p1[0] - p0[0];
+    const dz = p1[2] - p0[2];
+    if (Math.abs(dx) > 0.001 || Math.abs(dz) > 0.001) {
+      angleRef.current = Math.atan2(dx, dz);
+    }
+
+    if (groupRef.current) {
+      groupRef.current.position.set(posX, 0, posZ);
+      groupRef.current.rotation.y = THREE.MathUtils.lerp(
+        groupRef.current.rotation.y,
+        angleRef.current,
+        0.25
+      );
+    }
+
+    if (onPositionUpdate) {
+      onPositionUpdate([posX, 0, posZ]);
+    }
   });
 
   return (
-    <group position={[currentPos[0], currentPos[1], currentPos[2]]} rotation={[0, rotationAngle, 0]}>
+    <group ref={groupRef} position={gridToWorld(DOCK_COORD.x, DOCK_COORD.y, 0)}>
       {/* Mobile Cart Chassis */}
       <mesh position={[0, 0.22, 0]} castShadow>
         <boxGeometry args={[0.9, 0.22, 1.2]} />
@@ -445,13 +655,12 @@ function AnimatedPicker({ currentPos, rotationAngle, carriedBoxCount }) {
       <group position={[0, 1.25, -0.5]} ref={beaconRef}>
         <mesh>
           <cylinderGeometry args={[0.07, 0.07, 0.14, 12]} />
-          <meshStandardMaterial color="#f59e0b" emissive="#f59e0b" emissiveIntensity={1.2} />
+          <meshStandardMaterial color="#f59e0b" emissive="#f59e0b" emissiveIntensity={1.4} />
         </mesh>
       </group>
 
-      {/* Operator Avatar (Stylized Human with High-Vis Safety Vest & Helmet) */}
+      {/* Operator Avatar (Human in High-Vis Vest & Helmet) */}
       <group position={[0, 0, -0.9]}>
-        {/* Legs / Pants */}
         <mesh position={[-0.14, 0.45, 0]}>
           <cylinderGeometry args={[0.08, 0.08, 0.6, 12]} />
           <meshStandardMaterial color="#1e293b" />
@@ -460,31 +669,27 @@ function AnimatedPicker({ currentPos, rotationAngle, carriedBoxCount }) {
           <cylinderGeometry args={[0.08, 0.08, 0.6, 12]} />
           <meshStandardMaterial color="#1e293b" />
         </mesh>
-        {/* Torso with High-Vis Yellow Vest */}
         <mesh position={[0, 1.0, 0]} castShadow>
           <boxGeometry args={[0.42, 0.55, 0.26]} />
           <meshStandardMaterial color="#eab308" roughness={0.5} />
         </mesh>
-        {/* Reflective silver stripes */}
         <mesh position={[0, 1.02, 0.14]}>
           <planeGeometry args={[0.38, 0.08]} />
           <meshBasicMaterial color="#ffffff" />
         </mesh>
-        {/* Head */}
         <mesh position={[0, 1.45, 0]} castShadow>
           <sphereGeometry args={[0.14, 16, 16]} />
           <meshStandardMaterial color="#fcd34d" roughness={0.8} />
         </mesh>
-        {/* Safety Hard Hat / Helmet */}
         <mesh position={[0, 1.54, 0]}>
           <cylinderGeometry args={[0.18, 0.17, 0.1, 16]} />
           <meshStandardMaterial color="#ffffff" metalness={0.2} roughness={0.3} />
         </mesh>
       </group>
 
-      {/* Picked Cargo Tote / Boxes dynamically loading onto cart */}
+      {/* Dynamic Stacked Cargo Boxes */}
       <group position={[0, 0.42, 0.15]}>
-        {Array.from({ length: Math.min(carriedBoxCount, 6) }).map((_, idx) => {
+        {Array.from({ length: Math.min(carriedBoxCount, 8) }).map((_, idx) => {
           const col = idx % 2;
           const row = Math.floor(idx / 2);
           return (
@@ -503,7 +708,7 @@ function AnimatedPicker({ currentPos, rotationAngle, carriedBoxCount }) {
   );
 }
 
-// Camera Manager for View Presets (Overview, Top-Down, Follow Picker)
+// Camera Manager for View Presets
 function CameraController({ cameraMode, pickerPos }) {
   const controlsRef = useRef();
 
@@ -536,58 +741,45 @@ function CameraController({ cameraMode, pickerPos }) {
 }
 
 // ==========================================
-// 4. MAIN APPLICATION COMPONENT
+// 6. MAIN APPLICATION COMPONENT
 // ==========================================
 export default function App() {
-  // Raw Data State
   const [products, setProducts] = useState([]);
   const [orders, setOrders] = useState([]);
   const [dataLoaded, setDataLoaded] = useState(false);
   const [errorMsg, setErrorMsg] = useState(null);
 
-  // Layouts State: maps slotId -> Product Object
   const [baselineLayout, setBaselineLayout] = useState({});
   const [customLayout, setCustomLayout] = useState({});
-  const [activeLayoutView, setActiveLayoutView] = useState('CUSTOM'); // 'BASELINE' | 'CUSTOM'
+  const [activeLayoutView, setActiveLayoutView] = useState('CUSTOM');
 
-  // Interactive Swap State
+  const [batchSize, setBatchSize] = useState(3);
+  const [simSpeed, setSimSpeed] = useState(5);
+  const [isPlaying, setIsPlaying] = useState(true);
+
   const [selectedSlotId, setSelectedSlotId] = useState(null);
   const [swapFeedback, setSwapFeedback] = useState(null);
   const [hoveredProduct, setHoveredProduct] = useState(null);
+  const [cameraMode, setCameraMode] = useState('PERSPECTIVE');
 
-  // Camera preset
-  const [cameraMode, setCameraMode] = useState('PERSPECTIVE'); // 'PERSPECTIVE' | 'TOP' | 'FOLLOW'
+  // UI Panels Collapsible State
+  const [leftPanelOpen, setLeftPanelOpen] = useState(true);
+  const [rightPanelOpen, setRightPanelOpen] = useState(true);
 
-  // Simulation Controls & Engine State
-  const [isPlaying, setIsPlaying] = useState(true);
-  const [simSpeed, setSimSpeed] = useState(2); // 1x, 2x, 5x, 10x, 25x
-  const [orderIndex, setOrderIndex] = useState(0);
-  const [itemIndex, setItemIndex] = useState(0);
-
-  // Live Cumulative Simulation Metrics for comparison
-  const [baselineStats, setBaselineStats] = useState({
-    distanceMeters: 0,
-    totalSeconds: 0,
-    ordersCompleted: 0,
-    itemsPicked: 0,
-  });
-
-  const [customStats, setCustomStats] = useState({
-    distanceMeters: 0,
-    totalSeconds: 0,
-    ordersCompleted: 0,
-    itemsPicked: 0,
-  });
-
-  // 3D Animation Picker State
-  const [pickerGridPos, setPickerGridPos] = useState({ x: DOCK_COORD.x, y: DOCK_COORD.y });
-  const [pickerWorldPos, setPickerWorldPos] = useState(gridToWorld(DOCK_COORD.x, DOCK_COORD.y, 0));
-  const [pickerAngle, setPickerAngle] = useState(0);
-  const [activePathWaypoints, setActivePathWaypoints] = useState([]);
-  const [currentWaypointIdx, setCurrentWaypointIdx] = useState(0);
+  // Active Batch Trip State Machine
+  const [batchStartIndex, setBatchStartIndex] = useState(0);
+  const [currentSegmentIndex, setCurrentSegmentIndex] = useState(0);
   const [boxesOnCart, setBoxesOnCart] = useState(0);
+  const [pickerWorldPos, setPickerWorldPos] = useState(gridToWorld(DOCK_COORD.x, DOCK_COORD.y, 0));
 
-  // Slots with precomputed dock distance
+  // Live Cumulative Simulation Metrics
+  const [liveStats, setLiveStats] = useState({
+    tripsCompleted: 0,
+    ordersProcessed: 0,
+    distanceWalkedM: 0,
+    secondsElapsed: 0,
+  });
+
   const slotsWithDistances = useMemo(() => {
     return WAREHOUSE_SLOTS.map((slot) => {
       const dist = getCachedDistance(DOCK_COORD, { x: slot.pickX, y: slot.pickY });
@@ -595,9 +787,6 @@ export default function App() {
     });
   }, []);
 
-  // ----------------------------------------------------
-  // Load orders.json on mount
-  // ----------------------------------------------------
   useEffect(() => {
     fetch('/orders.json')
       .then((res) => {
@@ -610,19 +799,14 @@ export default function App() {
         setProducts(prods);
         setOrders(ords);
 
-        // ----------------------------------------------------
-        // Build Automatic Baseline Layout:
-        // Fastest-moving items (lowest rank) slotted nearest to packing dock
-        // ----------------------------------------------------
         const sortedSlots = [...slotsWithDistances].sort((a, b) => a.dockDistance - b.dockDistance);
-
         const baseMap = {};
         const custMap = {};
 
         sortedSlots.forEach((slot, idx) => {
           if (idx < prods.length) {
             baseMap[slot.slotId] = prods[idx];
-            custMap[slot.slotId] = prods[idx]; // Initially clone baseline
+            custMap[slot.slotId] = prods[idx];
           }
         });
 
@@ -636,17 +820,6 @@ export default function App() {
       });
   }, [slotsWithDistances]);
 
-  // Lookup product to slot ID for current active layout
-  const productToSlotMap = useMemo(() => {
-    const layout = activeLayoutView === 'BASELINE' ? baselineLayout : customLayout;
-    const map = new Map();
-    for (const [slotId, prod] of Object.entries(layout)) {
-      if (prod) map.set(prod.stock_code, parseInt(slotId, 10));
-    }
-    return map;
-  }, [activeLayoutView, baselineLayout, customLayout]);
-
-  // Reverse lookups for scoring both layouts concurrently
   const baselineProdToSlot = useMemo(() => {
     const map = new Map();
     for (const [slotId, prod] of Object.entries(baselineLayout)) {
@@ -663,9 +836,158 @@ export default function App() {
     return map;
   }, [customLayout]);
 
-  // ----------------------------------------------------
-  // Layout Management & Swap Game Mode
-  // ----------------------------------------------------
+  // Instant Full-Month Benchmark across all 1,367 orders
+  const monthlyBenchmark = useMemo(() => {
+    if (!dataLoaded || orders.length === 0) return null;
+
+    const baselineSingle = calculateFullMonthMetrics(
+      orders,
+      baselineProdToSlot,
+      slotsWithDistances,
+      1,
+      getCachedDistance
+    );
+
+    const customSingle = calculateFullMonthMetrics(
+      orders,
+      customProdToSlot,
+      slotsWithDistances,
+      1,
+      getCachedDistance
+    );
+
+    const benchmarkBatchSize = batchSize > 1 ? batchSize : 3;
+    const customBatched = calculateFullMonthMetrics(
+      orders,
+      customProdToSlot,
+      slotsWithDistances,
+      benchmarkBatchSize,
+      getCachedDistance
+    );
+
+    const distSavedVsCustomSingle = customSingle.distanceM - customBatched.distanceM;
+    const distSavedVsCustomSinglePct = ((distSavedVsCustomSingle / customSingle.distanceM) * 100).toFixed(1);
+    const timeSavedVsCustomSingleHours = (customSingle.timeSec - customBatched.timeSec) / 3600;
+
+    return {
+      baselineSingle,
+      customSingle,
+      customBatched,
+      benchmarkBatchSize,
+      distSavedVsCustomSingleKm: (distSavedVsCustomSingle / 1000).toFixed(1),
+      distSavedVsCustomSinglePct,
+      timeSavedVsCustomSingleHours: timeSavedVsCustomSingleHours.toFixed(1),
+    };
+  }, [dataLoaded, orders, baselineProdToSlot, customProdToSlot, slotsWithDistances, batchSize]);
+
+  // Active Batch Orders Slice
+  const currentBatchOrders = useMemo(() => {
+    if (!orders || orders.length === 0) return [];
+    const end = Math.min(batchStartIndex + batchSize, orders.length);
+    return orders.slice(batchStartIndex, end);
+  }, [orders, batchStartIndex, batchSize]);
+
+  // Active Batch Stops (TSP-Ordered)
+  const currentBatchStops = useMemo(() => {
+    if (!currentBatchOrders || currentBatchOrders.length === 0) return [];
+
+    const activeProdToSlot = activeLayoutView === 'BASELINE' ? baselineProdToSlot : customProdToSlot;
+    const uniqueSlotMap = new Map();
+
+    for (const ord of currentBatchOrders) {
+      for (const line of ord.lines) {
+        const sId = activeProdToSlot.get(line.stock_code);
+        if (sId !== undefined) {
+          const slot = slotsWithDistances.find((s) => s.slotId === sId);
+          if (slot) {
+            if (!uniqueSlotMap.has(sId)) {
+              uniqueSlotMap.set(sId, {
+                ...slot,
+                items: [{ stock_code: line.stock_code, description: line.description, quantity: line.quantity }],
+                totalUnits: line.quantity,
+                orderIds: [ord.order_id],
+              });
+            } else {
+              const existing = uniqueSlotMap.get(sId);
+              existing.items.push({ stock_code: line.stock_code, description: line.description, quantity: line.quantity });
+              existing.totalUnits += line.quantity;
+              if (!existing.orderIds.includes(ord.order_id)) {
+                existing.orderIds.push(ord.order_id);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    const rawStops = Array.from(uniqueSlotMap.values());
+    const ordered = batchSize > 1 ? solveNearestNeighborTSP(DOCK_COORD, rawStops, getCachedDistance) : rawStops;
+
+    return ordered.map((s, idx) => ({ ...s, stopNumber: idx + 1 }));
+  }, [currentBatchOrders, activeLayoutView, baselineProdToSlot, customProdToSlot, slotsWithDistances, batchSize]);
+
+  // SEGMENTED ROUTE CONSTRUCTION
+  // [Segment 0: Dock -> Stop 1, Segment 1: Stop 1 -> Stop 2, ..., Segment K: Stop K -> Dock]
+  const currentTripSegments = useMemo(() => {
+    if (!currentBatchStops || currentBatchStops.length === 0) return [];
+
+    const segments = [];
+    let startPoint = DOCK_COORD;
+
+    for (let i = 0; i < currentBatchStops.length; i++) {
+      const stop = currentBatchStops[i];
+      const endPoint = { x: stop.pickX, y: stop.pickY };
+      const path = findAStarPath(startPoint, endPoint);
+
+      segments.push({
+        segmentIndex: i,
+        start: startPoint,
+        end: endPoint,
+        path,
+        targetSlot: stop,
+        items: stop.items,
+        totalUnits: stop.totalUnits,
+        isDock: false,
+        stopNumber: i + 1,
+      });
+
+      startPoint = endPoint;
+    }
+
+    // Return to Packing Dock segment
+    const returnPath = findAStarPath(startPoint, DOCK_COORD);
+    segments.push({
+      segmentIndex: currentBatchStops.length,
+      start: startPoint,
+      end: DOCK_COORD,
+      path: returnPath,
+      targetSlot: null,
+      items: [],
+      totalUnits: 0,
+      isDock: true,
+      stopNumber: null,
+    });
+
+    return segments;
+  }, [currentBatchStops]);
+
+  // Full continuous path ribbon for the current batch
+  const fullBatchWaypoints = useMemo(() => {
+    if (!currentTripSegments || currentTripSegments.length === 0) return [];
+    const full = [];
+    currentTripSegments.forEach((seg, sIdx) => {
+      if (seg.path && seg.path.length > 0) {
+        if (sIdx === 0) {
+          full.push(...seg.path);
+        } else {
+          full.push(...seg.path.slice(1));
+        }
+      }
+    });
+    return full;
+  }, [currentTripSegments]);
+
+  // Handle slot swapping
   const handleSlotSelect = useCallback(
     (slotId) => {
       if (activeLayoutView !== 'CUSTOM') {
@@ -678,13 +1000,10 @@ export default function App() {
       }
 
       if (selectedSlotId === null) {
-        // Select first slot
         setSelectedSlotId(slotId);
       } else if (selectedSlotId === slotId) {
-        // Deselect
         setSelectedSlotId(null);
       } else {
-        // Swap selectedSlotId with slotId
         setCustomLayout((prev) => {
           const updated = { ...prev };
           const prodA = updated[selectedSlotId];
@@ -703,14 +1022,12 @@ export default function App() {
         setSelectedSlotId(null);
         setTimeout(() => setSwapFeedback(null), 3500);
 
-        // Reset cumulative simulation to score newly swapped layout cleanly
         resetSimulation();
       }
     },
     [activeLayoutView, selectedSlotId, customLayout]
   );
 
-  // Quick preset: Reset custom to optimal baseline
   const handleResetToBaseline = useCallback(() => {
     setCustomLayout({ ...baselineLayout });
     setSelectedSlotId(null);
@@ -719,11 +1036,9 @@ export default function App() {
     setTimeout(() => setSwapFeedback(null), 3000);
   }, [baselineLayout]);
 
-  // Quick preset: Randomize layout (chaotic / unoptimized warehouse)
   const handleRandomizeLayout = useCallback(() => {
     const slotKeys = Object.keys(customLayout);
     const prodValues = Object.values(customLayout);
-    // Fisher-Yates shuffle
     for (let i = prodValues.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [prodValues[i], prodValues[j]] = [prodValues[j], prodValues[i]];
@@ -739,7 +1054,6 @@ export default function App() {
     setTimeout(() => setSwapFeedback(null), 3000);
   }, [customLayout]);
 
-  // Quick preset: Inverted layout (Worst-case: fastest items furthest away)
   const handleInvertLayout = useCallback(() => {
     const sortedSlots = [...slotsWithDistances].sort((a, b) => b.dockDistance - a.dockDistance);
     const inverted = {};
@@ -755,187 +1069,65 @@ export default function App() {
     setTimeout(() => setSwapFeedback(null), 3000);
   }, [slotsWithDistances, products]);
 
-  // Reset simulation counters
+  const handleBatchSizeChange = (newSize) => {
+    setBatchSize(newSize);
+    resetSimulation();
+    setSwapFeedback({
+      type: 'info',
+      text: newSize === 1 ? 'Single Order Picking' : `Batch Picking Enabled (${newSize} Orders via Nearest-Neighbor TSP)`,
+    });
+    setTimeout(() => setSwapFeedback(null), 3000);
+  };
+
   const resetSimulation = () => {
-    setOrderIndex(0);
-    setItemIndex(0);
-    setBaselineStats({ distanceMeters: 0, totalSeconds: 0, ordersCompleted: 0, itemsPicked: 0 });
-    setCustomStats({ distanceMeters: 0, totalSeconds: 0, ordersCompleted: 0, itemsPicked: 0 });
-    setPickerGridPos({ x: DOCK_COORD.x, y: DOCK_COORD.y });
-    setPickerWorldPos(gridToWorld(DOCK_COORD.x, DOCK_COORD.y, 0));
-    setActivePathWaypoints([]);
-    setCurrentWaypointIdx(0);
+    setBatchStartIndex(0);
+    setCurrentSegmentIndex(0);
     setBoxesOnCart(0);
+    setLiveStats({
+      tripsCompleted: 0,
+      ordersProcessed: 0,
+      distanceWalkedM: 0,
+      secondsElapsed: 0,
+    });
   };
 
-  // ----------------------------------------------------
-  // SIMULATION & PATH EXECUTION LOOP
-  // ----------------------------------------------------
-  useEffect(() => {
-    if (!dataLoaded || orders.length === 0 || !isPlaying) return;
-
-    const currentOrder = orders[orderIndex % orders.length];
-    if (!currentOrder || !currentOrder.lines || currentOrder.lines.length === 0) return;
-
-    let targetGridCoord;
-    const isReturningToDock = itemIndex >= currentOrder.lines.length;
-
-    if (isReturningToDock) {
-      // Returning to Packing Dock to complete picking trip
-      targetGridCoord = DOCK_COORD;
-    } else {
-      // Moving to next item rack pick point
-      const currentLine = currentOrder.lines[itemIndex];
-      const slotId = productToSlotMap.get(currentLine.stock_code);
-      if (slotId !== undefined) {
-        const slot = slotsWithDistances.find((s) => s.slotId === slotId);
-        targetGridCoord = slot ? { x: slot.pickX, y: slot.pickY } : DOCK_COORD;
-      } else {
-        targetGridCoord = DOCK_COORD;
-      }
-    }
-
-    // Compute A* Path from current picker grid pos to target
-    const path = findAStarPath(pickerGridPos, targetGridCoord);
-    setActivePathWaypoints(path);
-    setCurrentWaypointIdx(0);
-  }, [orderIndex, itemIndex, isPlaying, dataLoaded, orders, productToSlotMap, slotsWithDistances]);
-
-  // Animation frame loop moving the picker through waypoints
-  useEffect(() => {
-    if (!isPlaying || activePathWaypoints.length < 2) return;
-
-    const intervalTime = Math.max(16, 200 / simSpeed);
-    const timer = setInterval(() => {
-      setCurrentWaypointIdx((prevIdx) => {
-        if (prevIdx < activePathWaypoints.length - 1) {
-          const nextIdx = prevIdx + 1;
-          const prevWp = activePathWaypoints[prevIdx];
-          const nextWp = activePathWaypoints[nextIdx];
-
-          // Compute angle of movement
-          const dx = nextWp.x - prevWp.x;
-          const dy = nextWp.y - prevWp.y;
-          const angle = Math.atan2(dx, dy);
-
-          setPickerAngle(angle);
-          setPickerGridPos(nextWp);
-          setPickerWorldPos(gridToWorld(nextWp.x, nextWp.y, 0));
-
-          return nextIdx;
-        } else {
-          // Reached destination waypoint
-          clearInterval(timer);
-          onTargetReached();
-          return prevIdx;
-        }
-      });
-    }, intervalTime);
-
-    return () => clearInterval(timer);
-  }, [activePathWaypoints, isPlaying, simSpeed]);
-
-  // When picker reaches an item or dock
-  const onTargetReached = () => {
-    const currentOrder = orders[orderIndex % orders.length];
-    if (!currentOrder) return;
-
-    const isReturningToDock = itemIndex >= currentOrder.lines.length;
-
-    if (!isReturningToDock) {
-      // Picked an item
-      setBoxesOnCart((prev) => prev + 1);
-      setItemIndex((prev) => prev + 1);
-    } else {
-      // Completed entire picking trip at dock! Score both layouts for this order.
-      scoreCompletedOrder(currentOrder);
-      setBoxesOnCart(0);
-      setItemIndex(0);
-      setOrderIndex((prev) => (prev + 1) % orders.length);
-    }
+  // Callback when a segment completes pick pause
+  const handleSegmentComplete = (nextSegIdx) => {
+    setCurrentSegmentIndex(nextSegIdx);
   };
 
-  // Replay & Score order lines identically across Baseline & Custom layouts
-  const scoreCompletedOrder = (order) => {
-    // 1. Calculate Baseline Trip Distance
-    let baseDist = 0;
-    let baseCurr = DOCK_COORD;
-    for (const line of order.lines) {
-      const sId = baselineProdToSlot.get(line.stock_code);
-      if (sId !== undefined) {
-        const slot = slotsWithDistances.find((s) => s.slotId === sId);
-        if (slot) {
-          const target = { x: slot.pickX, y: slot.pickY };
-          baseDist += getCachedDistance(baseCurr, target);
-          baseCurr = target;
-        }
-      }
-    }
-    baseDist += getCachedDistance(baseCurr, DOCK_COORD); // Return to dock
-    const basePickSeconds = (baseDist / HUMAN_WALK_SPEED) + (order.lines.length * ITEM_PICK_TIME);
+  // Callback when items are picked at a rack stop
+  const handlePickAction = () => {
+    setBoxesOnCart((prev) => prev + 1);
+  };
 
-    // 2. Calculate Custom Trip Distance
-    let custDist = 0;
-    let custCurr = DOCK_COORD;
-    for (const line of order.lines) {
-      const sId = customProdToSlot.get(line.stock_code);
-      if (sId !== undefined) {
-        const slot = slotsWithDistances.find((s) => s.slotId === sId);
-        if (slot) {
-          const target = { x: slot.pickX, y: slot.pickY };
-          custDist += getCachedDistance(custCurr, target);
-          custCurr = target;
-        }
-      }
-    }
-    custDist += getCachedDistance(custCurr, DOCK_COORD); // Return to dock
-    const custPickSeconds = (custDist / HUMAN_WALK_SPEED) + (order.lines.length * ITEM_PICK_TIME);
+  // Callback when the final return to dock segment finishes
+  const handleTripComplete = () => {
+    // 1. Calculate this trip's distance & time
+    let tripDistance = 0;
+    currentTripSegments.forEach((seg) => {
+      tripDistance += Math.max(0, seg.path.length - 1) * CELL_SIZE;
+    });
 
-    setBaselineStats((prev) => ({
-      distanceMeters: prev.distanceMeters + baseDist,
-      totalSeconds: prev.totalSeconds + basePickSeconds,
-      ordersCompleted: prev.ordersCompleted + 1,
-      itemsPicked: prev.itemsPicked + order.lines.length,
+    const linesInBatch = currentBatchOrders.reduce((sum, o) => sum + o.lines.length, 0);
+    const tripSeconds = (tripDistance / HUMAN_WALK_SPEED) + (linesInBatch * ITEM_PICK_TIME);
+
+    // 2. Increment live stats
+    setLiveStats((prev) => ({
+      tripsCompleted: prev.tripsCompleted + 1,
+      ordersProcessed: prev.ordersProcessed + currentBatchOrders.length,
+      distanceWalkedM: prev.distanceWalkedM + tripDistance,
+      secondsElapsed: prev.secondsElapsed + tripSeconds,
     }));
 
-    setCustomStats((prev) => ({
-      distanceMeters: prev.distanceMeters + custDist,
-      totalSeconds: prev.totalSeconds + custPickSeconds,
-      ordersCompleted: prev.ordersCompleted + 1,
-      itemsPicked: prev.itemsPicked + order.lines.length,
-    }));
+    // 3. Reset cargo and advance to next batch
+    setBoxesOnCart(0);
+    setCurrentSegmentIndex(0);
+    setBatchStartIndex((prev) => (prev + batchSize) % (orders.length || 1));
   };
 
-  // Performance comparison metrics
   const activeLayoutMap = activeLayoutView === 'BASELINE' ? baselineLayout : customLayout;
-  const currentOrder = orders[orderIndex % (orders.length || 1)];
-
-  const baselineAvgTime =
-    baselineStats.ordersCompleted > 0
-      ? (baselineStats.totalSeconds / baselineStats.ordersCompleted).toFixed(1)
-      : '0.0';
-  const customAvgTime =
-    customStats.ordersCompleted > 0
-      ? (customStats.totalSeconds / customStats.ordersCompleted).toFixed(1)
-      : '0.0';
-
-  const distanceDeltaPct =
-    baselineStats.distanceMeters > 0
-      ? (
-          ((customStats.distanceMeters - baselineStats.distanceMeters) /
-            baselineStats.distanceMeters) *
-          100
-        ).toFixed(1)
-      : '0.0';
-
-  const timeDeltaPct =
-    baselineStats.totalSeconds > 0
-      ? (
-          ((customStats.totalSeconds - baselineStats.totalSeconds) /
-            baselineStats.totalSeconds) *
-          100
-        ).toFixed(1)
-      : '0.0';
+  const currentSegment = currentTripSegments[currentSegmentIndex];
 
   if (errorMsg) {
     return (
@@ -943,9 +1135,6 @@ export default function App() {
         <div className="bg-red-950/80 border border-red-500 p-6 rounded-xl max-w-lg text-center">
           <h2 className="text-xl font-bold text-red-400">Data Loading Error</h2>
           <p className="mt-2 text-sm text-red-200">{errorMsg}</p>
-          <p className="mt-4 text-xs text-slate-400">
-            Please run <code>python process_orders.py</code> to generate <code>orders.json</code> in <code>3d-frontend/public/</code>.
-          </p>
         </div>
       </div>
     );
@@ -954,7 +1143,7 @@ export default function App() {
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-slate-950 select-none">
       {/* ====================================================
-          3D CANVAS SCENE (R3F)
+          1. 3D CANVAS SCENE (FULLSCREEN UNOBSTRUCTED)
       ==================================================== */}
       <Canvas
         shadows
@@ -970,10 +1159,7 @@ export default function App() {
         />
         <pointLight position={[0, 15, 0]} intensity={0.5} />
 
-        {/* Warehouse Floor */}
         <WarehouseFloor />
-
-        {/* Packing Dock */}
         <PackingDock />
 
         {/* 100 Storage Racks */}
@@ -993,86 +1179,43 @@ export default function App() {
           );
         })}
 
-        {/* Active A* Path Ribbon */}
-        <ActivePathRibbon waypoints={activePathWaypoints} />
+        {/* Continuous Full Batch Tour Path Ribbon */}
+        <ActivePathRibbon waypoints={fullBatchWaypoints} />
 
-        {/* Animated 3D Picker Mesh */}
-        <AnimatedPicker
-          currentPos={pickerWorldPos}
-          rotationAngle={pickerAngle}
-          carriedBoxCount={boxesOnCart}
+        {/* Numbered 3D Floating Markers & Glowing Floor Rings for Active Batch */}
+        <BatchTargetMarkers
+          stops={currentBatchStops}
+          currentSegmentIdx={currentSegmentIndex}
         />
 
-        {/* Camera Control Presets */}
+        {/* AGV Picker Mesh driven by useFrame State Machine */}
+        <AGVController
+          segments={currentTripSegments}
+          currentSegmentIdx={currentSegmentIndex}
+          isPlaying={isPlaying}
+          simSpeed={simSpeed}
+          carriedBoxCount={boxesOnCart}
+          onSegmentComplete={handleSegmentComplete}
+          onTripComplete={handleTripComplete}
+          onPickAction={handlePickAction}
+          onPositionUpdate={setPickerWorldPos}
+        />
+
         <CameraController cameraMode={cameraMode} pickerPos={pickerWorldPos} />
       </Canvas>
 
       {/* ====================================================
-          TOP NAVIGATION BAR & CONTROLS
-      ==================================================== */}
-      <header className="absolute top-0 left-0 right-0 p-4 flex flex-wrap items-center justify-between gap-3 pointer-events-none z-10">
-        <div className="flex items-center gap-3 bg-slate-900/90 backdrop-blur-md px-4 py-2.5 rounded-xl border border-slate-700/60 shadow-xl pointer-events-auto">
-          <div className="w-3 h-3 rounded-full bg-emerald-400 animate-pulse" />
-          <div>
-            <h1 className="text-sm font-bold tracking-wide text-white flex items-center gap-2">
-              NEXAI WAREHOUSE TWIN
-              <span className="text-[10px] font-semibold bg-sky-500/20 text-sky-400 px-2 py-0.5 rounded border border-sky-500/30">
-                100 SKU VELOCITY A*
-              </span>
-            </h1>
-            <p className="text-[11px] text-slate-400">
-              Online Retail II Dataset Replay • Dec 2009
-            </p>
-          </div>
-        </div>
-
-        {/* Camera View Switcher */}
-        <div className="flex items-center gap-1 bg-slate-900/90 backdrop-blur-md p-1 rounded-xl border border-slate-700/60 shadow-xl pointer-events-auto">
-          <button
-            onClick={() => setCameraMode('PERSPECTIVE')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
-              cameraMode === 'PERSPECTIVE'
-                ? 'bg-sky-500 text-white shadow'
-                : 'text-slate-400 hover:text-white'
-            }`}
-          >
-            3D View
-          </button>
-          <button
-            onClick={() => setCameraMode('TOP')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
-              cameraMode === 'TOP'
-                ? 'bg-sky-500 text-white shadow'
-                : 'text-slate-400 hover:text-white'
-            }`}
-          >
-            Top Down
-          </button>
-          <button
-            onClick={() => setCameraMode('FOLLOW')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
-              cameraMode === 'FOLLOW'
-                ? 'bg-sky-500 text-white shadow'
-                : 'text-slate-400 hover:text-white'
-            }`}
-          >
-            Follow Picker
-          </button>
-        </div>
-      </header>
-
-      {/* ====================================================
-          SWAP TOAST FEEDBACK
+          2. TOAST NOTIFICATION
       ==================================================== */}
       {swapFeedback && (
         <div className="absolute top-16 left-1/2 -translate-x-1/2 z-30 pointer-events-none transition-all">
           <div
-            className={`px-4 py-2 rounded-xl text-xs font-medium shadow-2xl backdrop-blur-md border ${
+            className={`px-4 py-2 rounded-xl text-xs font-semibold shadow-2xl backdrop-blur-md border ${
               swapFeedback.type === 'success'
                 ? 'bg-emerald-950/90 border-emerald-500 text-emerald-200'
                 : swapFeedback.type === 'warning'
                 ? 'bg-amber-950/90 border-amber-500 text-amber-200'
-                : 'bg-sky-950/90 border-sky-500 text-sky-200'
+                : 'bg-indigo-950/90 border-indigo-500 text-indigo-200'
             }`}
           >
             {swapFeedback.text}
@@ -1081,337 +1224,364 @@ export default function App() {
       )}
 
       {/* ====================================================
-          LEFT SIDEBAR: KPI BENCHMARK DASHBOARD
+          3. TOP FLOATING HUD BAR (COMPACT & SLEEK)
       ==================================================== */}
-      <aside className="absolute top-20 left-4 w-84 flex flex-col gap-3 pointer-events-none z-10">
-        {/* Layout Mode Toggle */}
-        <div className="bg-slate-900/90 backdrop-blur-md p-3 rounded-2xl border border-slate-700/60 shadow-xl pointer-events-auto">
-          <div className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider mb-2">
-            Active 3D Layout View
-          </div>
-          <div className="grid grid-cols-2 gap-1.5 p-1 bg-slate-950/80 rounded-xl border border-slate-800">
+      <header className="absolute top-3 left-4 right-4 flex items-center justify-between gap-3 pointer-events-none z-20">
+        {/* Title & Active Mode */}
+        <div className="flex items-center gap-2 bg-slate-900/95 backdrop-blur-md px-3.5 py-1.5 rounded-xl border border-slate-700/60 shadow-xl pointer-events-auto">
+          <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+          <span className="text-xs font-extrabold tracking-wide text-white">NEXAI TWIN</span>
+          <div className="h-4 w-px bg-slate-700 mx-1" />
+          <button
+            onClick={() => setActiveLayoutView((v) => (v === 'BASELINE' ? 'CUSTOM' : 'BASELINE'))}
+            className={`px-2 py-0.5 rounded text-[10px] font-bold transition flex items-center gap-1.5 ${
+              activeLayoutView === 'BASELINE'
+                ? 'bg-sky-500/20 text-sky-300 border border-sky-500/40'
+                : 'bg-purple-500/20 text-purple-300 border border-purple-500/40'
+            }`}
+          >
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${
+                activeLayoutView === 'BASELINE' ? 'bg-sky-400' : 'bg-purple-400'
+              }`}
+            />
+            {activeLayoutView === 'BASELINE' ? 'Baseline View' : 'Player Custom'}
+          </button>
+        </div>
+
+        {/* Center: Batch Size Selector */}
+        <div className="flex items-center gap-1 bg-slate-900/95 backdrop-blur-md p-1 rounded-xl border border-slate-700/60 shadow-xl pointer-events-auto">
+          <span className="text-[10px] font-semibold text-slate-400 px-1.5">Batch:</span>
+          {[
+            { size: 1, label: '1x Single' },
+            { size: 3, label: '3x TSP' },
+            { size: 5, label: '5x Mega' },
+          ].map(({ size, label }) => (
             <button
-              onClick={() => setActiveLayoutView('BASELINE')}
-              className={`py-1.5 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 ${
-                activeLayoutView === 'BASELINE'
-                  ? 'bg-sky-600 text-white shadow'
+              key={size}
+              onClick={() => handleBatchSizeChange(size)}
+              className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition ${
+                batchSize === size
+                  ? 'bg-indigo-600 text-white shadow'
                   : 'text-slate-400 hover:text-white'
               }`}
             >
-              <span className="w-2 h-2 rounded-full bg-sky-400" />
-              Baseline (Dock-Near)
+              {label}
             </button>
-            <button
-              onClick={() => setActiveLayoutView('CUSTOM')}
-              className={`py-1.5 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 ${
-                activeLayoutView === 'CUSTOM'
-                  ? 'bg-purple-600 text-white shadow'
-                  : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              <span className="w-2 h-2 rounded-full bg-purple-400" />
-              Player Custom
-            </button>
-          </div>
+          ))}
         </div>
 
-        {/* Comparative KPI Scoreboard */}
-        <div className="bg-slate-900/90 backdrop-blur-md p-4 rounded-2xl border border-slate-700/60 shadow-xl pointer-events-auto space-y-3">
-          <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-            <h2 className="text-xs font-bold tracking-wider text-slate-300 uppercase">
-              Scoring Engine (Live Replay)
-            </h2>
-            <span className="text-[10px] text-slate-400">
-              Orders: <strong>{baselineStats.ordersCompleted}</strong>
-            </span>
-          </div>
-
-          {/* Metric 1: Walking Distance */}
-          <div className="space-y-1.5">
-            <div className="flex justify-between text-xs font-semibold">
-              <span className="text-slate-400">Total Walking Distance:</span>
-              <span
-                className={`font-bold px-1.5 py-0.5 rounded text-[11px] ${
-                  parseFloat(distanceDeltaPct) <= 0
-                    ? 'bg-emerald-500/20 text-emerald-300'
-                    : 'bg-red-500/20 text-red-300'
-                }`}
-              >
-                {parseFloat(distanceDeltaPct) > 0 ? `+${distanceDeltaPct}%` : `${distanceDeltaPct}%`}
-              </span>
-            </div>
-            <div className="grid grid-cols-2 gap-2 text-xs">
-              <div className="bg-slate-950/70 p-2 rounded-lg border border-sky-500/20">
-                <div className="text-[10px] text-sky-400 font-medium">Baseline</div>
-                <div className="text-base font-bold text-white mt-0.5">
-                  {baselineStats.distanceMeters.toFixed(0)}{' '}
-                  <span className="text-[10px] font-normal text-slate-400">m</span>
-                </div>
-              </div>
-              <div className="bg-slate-950/70 p-2 rounded-lg border border-purple-500/20">
-                <div className="text-[10px] text-purple-400 font-medium">Custom Layout</div>
-                <div className="text-base font-bold text-white mt-0.5">
-                  {customStats.distanceMeters.toFixed(0)}{' '}
-                  <span className="text-[10px] font-normal text-slate-400">m</span>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Metric 2: Average Pick Time */}
-          <div className="space-y-1.5">
-            <div className="flex justify-between text-xs font-semibold">
-              <span className="text-slate-400">Avg Pick Time / Order:</span>
-              <span
-                className={`font-bold px-1.5 py-0.5 rounded text-[11px] ${
-                  parseFloat(timeDeltaPct) <= 0
-                    ? 'bg-emerald-500/20 text-emerald-300'
-                    : 'bg-red-500/20 text-red-300'
-                }`}
-              >
-                {parseFloat(timeDeltaPct) > 0 ? `+${timeDeltaPct}%` : `${timeDeltaPct}%`}
-              </span>
-            </div>
-            <div className="grid grid-cols-2 gap-2 text-xs">
-              <div className="bg-slate-950/70 p-2 rounded-lg border border-sky-500/20">
-                <div className="text-[10px] text-sky-400 font-medium">Baseline</div>
-                <div className="text-base font-bold text-white mt-0.5">
-                  {baselineAvgTime}{' '}
-                  <span className="text-[10px] font-normal text-slate-400">sec</span>
-                </div>
-              </div>
-              <div className="bg-slate-950/70 p-2 rounded-lg border border-purple-500/20">
-                <div className="text-[10px] text-purple-400 font-medium">Custom Layout</div>
-                <div className="text-base font-bold text-white mt-0.5">
-                  {customAvgTime}{' '}
-                  <span className="text-[10px] font-normal text-slate-400">sec</span>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Efficiency verdict tag */}
-          <div className="pt-1 text-center">
-            {parseFloat(distanceDeltaPct) <= 0 ? (
-              <div className="text-[11px] text-emerald-400 bg-emerald-950/40 border border-emerald-500/30 p-1.5 rounded-lg">
-                ★ Custom layout matches/beats baseline efficiency!
-              </div>
-            ) : (
-              <div className="text-[11px] text-amber-300 bg-amber-950/40 border border-amber-500/30 p-1.5 rounded-lg">
-                ▲ Baseline is {distanceDeltaPct}% faster. Re-slot fast SKUs near dock!
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Game Mode: Slotting Presets & Instructions */}
-        <div className="bg-slate-900/90 backdrop-blur-md p-4 rounded-2xl border border-slate-700/60 shadow-xl pointer-events-auto space-y-2.5">
-          <div className="flex items-center justify-between">
-            <h3 className="text-xs font-bold tracking-wider text-slate-300 uppercase">
-              Slotting Game Mode
-            </h3>
-            {selectedSlotId !== null && (
-              <button
-                onClick={() => setSelectedSlotId(null)}
-                className="text-[10px] text-red-400 hover:underline"
-              >
-                Cancel Selection
-              </button>
-            )}
-          </div>
-
-          <p className="text-[11px] text-slate-400 leading-relaxed">
-            {selectedSlotId === null ? (
-              <>
-                Click any <strong>rack</strong> to select, then click another rack to{' '}
-                <strong className="text-purple-400">swap product slots</strong>!
-              </>
-            ) : (
-              <span className="text-sky-300 font-medium">
-                Slot #{selectedSlotId} selected. Click another rack to swap!
-              </span>
-            )}
-          </p>
-
-          <div className="grid grid-cols-3 gap-1.5 pt-1">
-            <button
-              onClick={handleResetToBaseline}
-              className="px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-semibold transition border border-slate-700"
-              title="Slot top velocity products nearest the dock"
-            >
-              Optimal
-            </button>
-            <button
-              onClick={handleRandomizeLayout}
-              className="px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-semibold transition border border-slate-700"
-              title="Randomize product slots"
-            >
-              Randomize
-            </button>
-            <button
-              onClick={handleInvertLayout}
-              className="px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-semibold transition border border-slate-700"
-              title="Worst case layout"
-            >
-              Invert (Worst)
-            </button>
-          </div>
-        </div>
-
-        {/* Heatmap Legend */}
-        <div className="bg-slate-900/90 backdrop-blur-md p-3 rounded-2xl border border-slate-700/60 shadow-xl pointer-events-auto">
-          <div className="text-[10px] font-semibold text-slate-400 mb-1.5 uppercase">
-            Pick Frequency Heatmap
-          </div>
-          <div className="flex items-center gap-1.5 text-[10px] text-slate-300">
-            <div className="flex items-center gap-1">
-              <span className="w-2.5 h-2.5 rounded-sm bg-[#ef4444]" />
-              <span>Top 15</span>
-            </div>
-            <div className="flex items-center gap-1">
-              <span className="w-2.5 h-2.5 rounded-sm bg-[#f97316]" />
-              <span>16-35</span>
-            </div>
-            <div className="flex items-center gap-1">
-              <span className="w-2.5 h-2.5 rounded-sm bg-[#eab308]" />
-              <span>36-60</span>
-            </div>
-            <div className="flex items-center gap-1">
-              <span className="w-2.5 h-2.5 rounded-sm bg-[#10b981]" />
-              <span>61-85</span>
-            </div>
-            <div className="flex items-center gap-1">
-              <span className="w-2.5 h-2.5 rounded-sm bg-[#3b82f6]" />
-              <span>86-100</span>
-            </div>
-          </div>
-        </div>
-      </aside>
-
-      {/* ====================================================
-          RIGHT SIDEBAR: CURRENT ORDER & HOVER DETAILS
-      ==================================================== */}
-      <aside className="absolute top-20 right-4 w-76 flex flex-col gap-3 pointer-events-none z-10">
-        {/* Live Active Order Trip Card */}
-        {currentOrder && (
-          <div className="bg-slate-900/90 backdrop-blur-md p-4 rounded-2xl border border-slate-700/60 shadow-xl pointer-events-auto space-y-2">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-              <span className="text-[11px] font-bold text-sky-400 uppercase tracking-wide">
-                Picking Trip: #{currentOrder.order_id}
-              </span>
-              <span className="text-[10px] text-slate-400">
-                Line {Math.min(itemIndex + 1, currentOrder.lines.length)} / {currentOrder.lines.length}
-              </span>
-            </div>
-
-            <div className="text-xs text-slate-300">
-              <div className="text-[10px] text-slate-500">Timestamp</div>
-              <div className="font-mono text-[11px] text-slate-200">{currentOrder.timestamp}</div>
-            </div>
-
-            <div className="space-y-1">
-              <div className="text-[10px] text-slate-500">Current Target SKU</div>
-              {itemIndex < currentOrder.lines.length ? (
-                <div className="bg-slate-950/80 p-2 rounded-lg border border-slate-800">
-                  <div className="font-bold text-sky-300 text-xs">
-                    {currentOrder.lines[itemIndex].stock_code}
-                  </div>
-                  <div className="text-[11px] text-slate-400 truncate">
-                    {currentOrder.lines[itemIndex].description}
-                  </div>
-                  <div className="text-[10px] text-slate-500 mt-1">
-                    Qty: <strong>{currentOrder.lines[itemIndex].quantity}</strong> units
-                  </div>
-                </div>
-              ) : (
-                <div className="bg-emerald-950/40 p-2 rounded-lg border border-emerald-500/30 text-emerald-300 text-xs font-semibold flex items-center gap-1.5">
-                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
-                  Returning to Packing Dock...
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* Selected / Hovered Product Card */}
-        {hoveredProduct && (
-          <div className="bg-slate-900/90 backdrop-blur-md p-4 rounded-2xl border border-slate-700/60 shadow-xl pointer-events-auto space-y-1.5">
-            <div className="flex justify-between items-center text-xs font-bold text-white">
-              <span>{hoveredProduct.stock_code}</span>
-              <span className="text-[10px] bg-sky-500/20 text-sky-300 px-1.5 py-0.5 rounded">
-                Rank #{hoveredProduct.rank}
-              </span>
-            </div>
-            <p className="text-[11px] text-slate-400 leading-snug">
-              {hoveredProduct.description}
-            </p>
-            <div className="pt-2 border-t border-slate-800 grid grid-cols-2 gap-2 text-xs text-slate-300">
-              <div>
-                <span className="text-[10px] text-slate-500 block">Pick Frequency</span>
-                <strong>{hoveredProduct.pick_frequency}</strong> picks
-              </div>
-              <div>
-                <span className="text-[10px] text-slate-500 block">Total Qty</span>
-                <strong>{hoveredProduct.total_quantity_picked}</strong> pcs
-              </div>
-            </div>
-          </div>
-        )}
-      </aside>
-
-      {/* ====================================================
-          BOTTOM CONTROLLER: SIMULATION PLAYBACK
-      ==================================================== */}
-      <footer className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-3 bg-slate-900/95 backdrop-blur-md px-5 py-2.5 rounded-2xl border border-slate-700/70 shadow-2xl pointer-events-auto z-10">
-        {/* Play / Pause */}
-        <button
-          onClick={() => setIsPlaying(!isPlaying)}
-          className={`px-4 py-1.5 rounded-xl text-xs font-bold transition flex items-center gap-2 ${
-            isPlaying
-              ? 'bg-amber-600 hover:bg-amber-500 text-white shadow'
-              : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow'
-          }`}
-        >
-          {isPlaying ? '⏸ Pause' : '▶ Play Replay'}
-        </button>
-
-        {/* Simulation Speed */}
-        <div className="flex items-center gap-1 border-l border-r border-slate-800 px-3">
-          <span className="text-[10px] text-slate-400 font-semibold mr-1">Speed:</span>
-          {[1, 2, 5, 10, 25].map((spd) => (
+        {/* Right: Play/Pause & Speed */}
+        <div className="flex items-center gap-1.5 bg-slate-900/95 backdrop-blur-md p-1 rounded-xl border border-slate-700/60 shadow-xl pointer-events-auto">
+          <button
+            onClick={() => setIsPlaying(!isPlaying)}
+            className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition flex items-center gap-1 ${
+              isPlaying
+                ? 'bg-amber-600/90 hover:bg-amber-500 text-white'
+                : 'bg-emerald-600/90 hover:bg-emerald-500 text-white'
+            }`}
+          >
+            {isPlaying ? '⏸' : '▶'}
+          </button>
+          <div className="h-4 w-px bg-slate-700 mx-0.5" />
+          {[1, 5, 10, 25].map((spd) => (
             <button
               key={spd}
               onClick={() => setSimSpeed(spd)}
-              className={`px-2 py-1 rounded text-[11px] font-semibold transition ${
+              className={`px-1.5 py-0.5 rounded text-[10px] font-semibold transition ${
                 simSpeed === spd
                   ? 'bg-sky-500 text-white'
-                  : 'text-slate-400 hover:text-slate-200'
+                  : 'text-slate-400 hover:text-white'
               }`}
             >
               {spd}x
             </button>
           ))}
         </div>
+      </header>
 
-        {/* Step Next Order */}
-        <button
-          onClick={() => {
-            setOrderIndex((prev) => (prev + 1) % orders.length);
-            setItemIndex(0);
-          }}
-          className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition"
-        >
-          ⏭ Next Order
-        </button>
+      {/* ====================================================
+          4. LEFT COLLAPSIBLE PANEL (SLOTTING & CONTROLS)
+      ==================================================== */}
+      <div className="absolute top-16 left-4 z-20 pointer-events-none">
+        {leftPanelOpen ? (
+          <aside className="w-72 bg-slate-900/95 backdrop-blur-md p-3.5 rounded-2xl border border-slate-700/60 shadow-2xl pointer-events-auto space-y-3">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+              <span className="text-xs font-bold text-slate-200 uppercase tracking-wide flex items-center gap-1.5">
+                <span>⚙️</span> Slotting & Camera
+              </span>
+              <button
+                onClick={() => setLeftPanelOpen(false)}
+                className="text-slate-400 hover:text-white text-xs px-1.5 py-0.5 rounded hover:bg-slate-800"
+                title="Collapse panel"
+              >
+                ✕
+              </button>
+            </div>
 
-        {/* Reset */}
-        <button
-          onClick={resetSimulation}
-          className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition"
-        >
-          ↺ Reset Stats
-        </button>
-      </footer>
+            {/* Camera Angle Presets */}
+            <div className="space-y-1">
+              <div className="text-[10px] font-semibold text-slate-400 uppercase">Camera View</div>
+              <div className="grid grid-cols-3 gap-1">
+                <button
+                  onClick={() => setCameraMode('PERSPECTIVE')}
+                  className={`py-1 text-[10px] font-semibold rounded-lg transition ${
+                    cameraMode === 'PERSPECTIVE'
+                      ? 'bg-sky-600 text-white'
+                      : 'bg-slate-800 text-slate-400 hover:text-white'
+                  }`}
+                >
+                  Isometric
+                </button>
+                <button
+                  onClick={() => setCameraMode('TOP')}
+                  className={`py-1 text-[10px] font-semibold rounded-lg transition ${
+                    cameraMode === 'TOP'
+                      ? 'bg-sky-600 text-white'
+                      : 'bg-slate-800 text-slate-400 hover:text-white'
+                  }`}
+                >
+                  Top-Down
+                </button>
+                <button
+                  onClick={() => setCameraMode('FOLLOW')}
+                  className={`py-1 text-[10px] font-semibold rounded-lg transition ${
+                    cameraMode === 'FOLLOW'
+                      ? 'bg-sky-600 text-white'
+                      : 'bg-slate-800 text-slate-400 hover:text-white'
+                  }`}
+                >
+                  Follow AGV
+                </button>
+              </div>
+            </div>
+
+            {/* Click-to-Swap Banner */}
+            <div
+              className={`p-2 rounded-xl text-xs border transition ${
+                selectedSlotId !== null
+                  ? 'bg-sky-950/80 border-sky-400 text-sky-200 animate-pulse'
+                  : 'bg-slate-950/70 border-slate-800 text-slate-400'
+              }`}
+            >
+              {selectedSlotId !== null ? (
+                <div className="flex justify-between items-center">
+                  <span>
+                    Slot <strong>#{selectedSlotId}</strong> selected — click any rack to swap!
+                  </span>
+                  <button
+                    onClick={() => setSelectedSlotId(null)}
+                    className="text-red-400 hover:underline text-[10px] font-bold ml-1"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <span>Click any rack to select, then click another to swap product slots.</span>
+              )}
+            </div>
+
+            {/* Layout Presets */}
+            <div className="space-y-1">
+              <div className="text-[10px] font-semibold text-slate-400 uppercase">Layout Presets</div>
+              <div className="grid grid-cols-3 gap-1">
+                <button
+                  onClick={handleResetToBaseline}
+                  className="py-1 text-[10px] font-bold rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
+                >
+                  Optimal
+                </button>
+                <button
+                  onClick={handleRandomizeLayout}
+                  className="py-1 text-[10px] font-bold rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
+                >
+                  Randomize
+                </button>
+                <button
+                  onClick={handleInvertLayout}
+                  className="py-1 text-[10px] font-bold rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
+                >
+                  Invert
+                </button>
+              </div>
+            </div>
+
+            {/* Heatmap Legend */}
+            <div className="pt-1 border-t border-slate-800">
+              <div className="text-[9px] font-semibold text-slate-400 mb-1 uppercase">
+                Pick Velocity Heatmap
+              </div>
+              <div className="flex justify-between text-[9px] text-slate-300">
+                <span className="flex items-center gap-1">
+                  <span className="w-2 h-2 rounded-sm bg-[#ef4444]" /> Top 15
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="w-2 h-2 rounded-sm bg-[#f97316]" /> 16-35
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="w-2 h-2 rounded-sm bg-[#eab308]" /> 36-60
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="w-2 h-2 rounded-sm bg-[#10b981]" /> 61-85
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="w-2 h-2 rounded-sm bg-[#3b82f6]" /> 86-100
+                </span>
+              </div>
+            </div>
+          </aside>
+        ) : (
+          <button
+            onClick={() => setLeftPanelOpen(true)}
+            className="bg-slate-900/90 backdrop-blur-md px-3 py-1.5 rounded-xl border border-slate-700/60 text-xs font-bold text-slate-300 shadow-xl pointer-events-auto hover:text-white"
+          >
+            ⚙️ Controls
+          </button>
+        )}
+      </div>
+
+      {/* ====================================================
+          5. RIGHT COLLAPSIBLE PANEL (TELEMETRY & INSTANT BENCHMARK)
+      ==================================================== */}
+      <div className="absolute top-16 right-4 z-20 pointer-events-none">
+        {rightPanelOpen ? (
+          <aside className="w-84 bg-slate-900/95 backdrop-blur-md p-3.5 rounded-2xl border border-slate-700/60 shadow-2xl pointer-events-auto space-y-3">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+              <span className="text-xs font-bold text-slate-200 uppercase tracking-wide flex items-center gap-1.5">
+                <span>⚡</span> Instant Benchmark (1,367 Orders)
+              </span>
+              <button
+                onClick={() => setRightPanelOpen(false)}
+                className="text-slate-400 hover:text-white text-xs px-1.5 py-0.5 rounded hover:bg-slate-800"
+                title="Collapse panel"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* 3-Tier Monthly Benchmark Summary */}
+            {monthlyBenchmark && (
+              <div className="space-y-1.5 text-xs">
+                {/* 1. Baseline Single */}
+                <div className="bg-slate-950/70 p-2 rounded-lg border border-sky-500/20 flex justify-between items-center">
+                  <div>
+                    <div className="text-[10px] text-sky-400 font-bold">1. Baseline (Single)</div>
+                    <div className="text-[11px] text-slate-300">
+                      {monthlyBenchmark.baselineSingle.distanceKm} km • {monthlyBenchmark.baselineSingle.timeHours} hrs
+                    </div>
+                  </div>
+                  <span className="text-[10px] text-slate-500">Ref</span>
+                </div>
+
+                {/* 2. Custom Single */}
+                <div className="bg-slate-950/70 p-2 rounded-lg border border-purple-500/20 flex justify-between items-center">
+                  <div>
+                    <div className="text-[10px] text-purple-400 font-bold">2. Custom (Single)</div>
+                    <div className="text-[11px] text-slate-300">
+                      {monthlyBenchmark.customSingle.distanceKm} km • {monthlyBenchmark.customSingle.timeHours} hrs
+                    </div>
+                  </div>
+                  <span className="text-[10px] text-purple-300 font-semibold">Active</span>
+                </div>
+
+                {/* 3. Custom Batched TSP */}
+                <div className="bg-indigo-950/60 p-2 rounded-lg border border-indigo-500/40 ring-1 ring-indigo-500/30 flex justify-between items-center">
+                  <div>
+                    <div className="text-[10px] text-emerald-400 font-bold">
+                      3. Custom ({monthlyBenchmark.benchmarkBatchSize}x Batch + TSP)
+                    </div>
+                    <div className="text-[11px] font-extrabold text-white">
+                      {monthlyBenchmark.customBatched.distanceKm} km • {monthlyBenchmark.customBatched.timeHours} hrs
+                    </div>
+                  </div>
+                  <span className="text-[10px] font-bold bg-emerald-500/20 text-emerald-300 px-1.5 py-0.5 rounded">
+                    -{monthlyBenchmark.distSavedVsCustomSinglePct}%
+                  </span>
+                </div>
+
+                {/* Savings Callout */}
+                <div className="p-2 bg-gradient-to-r from-emerald-950/80 to-indigo-950/80 border border-emerald-500/40 rounded-lg text-center text-[11px] text-emerald-300 font-semibold">
+                  Saves {monthlyBenchmark.distSavedVsCustomSingleKm} km & {monthlyBenchmark.timeSavedVsCustomSingleHours} labor hrs/mo!
+                </div>
+              </div>
+            )}
+
+            {/* Live Trip Progress Card */}
+            <div className="space-y-2 pt-2 border-t border-slate-800">
+              <div className="flex justify-between items-center text-xs">
+                <span className="font-bold text-slate-300 flex items-center gap-1.5">
+                  <span>🚚</span> Active Trip (
+                  {currentBatchOrders.map((o) => `#${o.order_id}`).join(', ')})
+                </span>
+                <span className="text-[10px] font-mono bg-slate-800 text-sky-300 px-1.5 py-0.5 rounded">
+                  {currentSegment && !currentSegment.isDock
+                    ? `Stop ${currentSegment.stopNumber} / ${currentBatchStops.length}`
+                    : 'Returning to Dock'}
+                </span>
+              </div>
+
+              {/* Target Stop Details */}
+              {currentSegment && !currentSegment.isDock && currentSegment.targetSlot ? (
+                <div className="bg-slate-950/80 p-2 rounded-lg border border-slate-800 text-xs space-y-0.5">
+                  <div className="text-sky-300 font-bold flex justify-between">
+                    <span>Target: Slot #{currentSegment.targetSlot.slotId}</span>
+                    <span className="text-[10px] text-slate-400">
+                      Units: {currentSegment.totalUnits}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-slate-400 truncate">
+                    {currentSegment.items[0]?.stock_code} - {currentSegment.items[0]?.description}
+                  </div>
+                </div>
+              ) : (
+                <div className="bg-emerald-950/50 p-2 rounded-lg border border-emerald-500/30 text-emerald-300 text-xs font-semibold flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+                  All Batch Items Collected! Unloading at Dock...
+                </div>
+              )}
+
+              {/* Live Cumulative Counters */}
+              <div className="grid grid-cols-3 gap-1 pt-1 text-center">
+                <div className="bg-slate-950/60 p-1.5 rounded-lg border border-slate-800">
+                  <div className="text-[9px] text-slate-500">Trips</div>
+                  <div className="text-xs font-bold text-white">{liveStats.tripsCompleted}</div>
+                </div>
+                <div className="bg-slate-950/60 p-1.5 rounded-lg border border-slate-800">
+                  <div className="text-[9px] text-slate-500">Orders</div>
+                  <div className="text-xs font-bold text-white">{liveStats.ordersProcessed}</div>
+                </div>
+                <div className="bg-slate-950/60 p-1.5 rounded-lg border border-slate-800">
+                  <div className="text-[9px] text-slate-500">Live Dist</div>
+                  <div className="text-xs font-bold text-emerald-400">
+                    {liveStats.distanceWalkedM.toFixed(0)}m
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Hovered Product Card */}
+            {hoveredProduct && (
+              <div className="p-2 bg-slate-950/90 border border-sky-500/30 rounded-lg text-xs space-y-0.5">
+                <div className="flex justify-between font-bold text-sky-300">
+                  <span>{hoveredProduct.stock_code}</span>
+                  <span className="text-[10px] text-slate-400">Rank #{hoveredProduct.rank}</span>
+                </div>
+                <div className="text-[10px] text-slate-300 truncate">{hoveredProduct.description}</div>
+                <div className="text-[10px] text-slate-400">
+                  Picks: {hoveredProduct.pick_frequency} • Qty: {hoveredProduct.total_quantity_picked}
+                </div>
+              </div>
+            )}
+          </aside>
+        ) : (
+          <button
+            onClick={() => setRightPanelOpen(true)}
+            className="bg-slate-900/90 backdrop-blur-md px-3 py-1.5 rounded-xl border border-slate-700/60 text-xs font-bold text-slate-300 shadow-xl pointer-events-auto hover:text-white"
+          >
+            ⚡ Telemetry
+          </button>
+        )}
+      </div>
     </div>
   );
 }

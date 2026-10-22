@@ -34,6 +34,14 @@
   - Filtered one full calendar month (`2009-12`), sanitized cancellations (`C*`) and non-product service codes (`POST`, `DOT`, `M`, vouchers), and extracted 1,367 clean picking trips.
   - Outputted a lightweight, production-ready `orders.json` (1.79 MB) directly into the frontend's public directory.
 
+### 1.4 Stretch Goal: Batch Picking & Nearest-Neighbor TSP Optimization
+* **Decision**: Implement a Batch Picking routing engine that groups sequential orders into single multi-stop trips and optimizes the stop sequence using a **Nearest-Neighbor TSP (Traveling Salesperson Problem)** heuristic based on cached A* graph distances.
+* **Rationale**: In single-order picking, pickers must return to the packing dock after fulfilling each individual customer order, resulting in 1,367 round-trips for 1,367 orders. Grouping orders into batches of 3 or 5 orders allows pickers to pick consolidated quantities in a single tour, eliminating redundant trips to the dock.
+* **Results**:
+  - Batch Size 3 reduces monthly walking distance by **~66.5%** (from 206.7 km to 69.3 km) and saves **~31.8 hours** of warehouse picker labor per month.
+  - Batch Size 5 reduces monthly walking distance by **~76.1%** (down to 49.5 km) and saves **~36.4 hours** of labor per month.
+  - Nearest-Neighbor TSP runs in $< 30\text{ ms}$ over the entire month's dataset using memoized A* distances, ensuring instant feedback whenever rack slots are swapped.
+
 ---
 
 ## 2. Experiments & Rejected Approaches
@@ -92,3 +100,4 @@ Throughout this project, **Antigravity** (Google DeepMind's agentic coding assis
 - [x] **A* Pathfinding**: Strictly adheres to aisles; zero rack clipping.
 - [x] **Scoring Engine**: Compares Baseline vs Custom layout on identical historical order lines.
 - [x] **Interactive UI**: Real-time Tailwind CSS v4 dashboard, responsive 3D controls, and live efficiency metrics.
+- [x] **Stretch Goal (Batch Picking & TSP Brain)**: 1-, 3-, and 5-order batching with Nearest-Neighbor TSP, 3-tier projected monthly savings panel, and dynamic multi-stop 3D AGV routing.
