@@ -84,6 +84,12 @@ During the development of this project, **Google Antigravity** (Google DeepMind'
    - *Antigravity Fix*: Re-architected the animation into a segmented route array (`currentTripSegments`) managed by an internal `useFrame` state machine (`AGVController`). Refs track segment progress and pick pauses, allowing the AGV to smoothly transition through multi-stop batch tours at 60 FPS without React re-render lag.
 4. **Tailwind CSS v4 UI Overhaul**:
    - Designed the floating HUD and collapsible sidebars with `pointer-events-none` root overlay and `pointer-events-auto` cards, guaranteeing $>75\%$ unobstructed center 3D viewport clearance while keeping OrbitControls and rack clicking responsive.
+5. **Architectural White Warehouse, Procedural Canvas Textures & Multi-Picker Fleet**:
+   - *Aesthetic Elevation*: Replaced generic grey ground with an architectural white facility framed in dark steel I-beam trusses on a black void (`#050508`) with realistic volumetric depth fog.
+   - *Zero-Asset Procedural Canvas Textures*: Implemented in-memory HTML5 2D canvas texture generators for corrugated cardboard boxes (with realistic shipping labels/barcodes), slatted wooden pallets, and safety hazard striping, guaranteeing instantaneous zero-network load times.
+   - *Articulated Multi-Picker Fleet*: Added support for 1 to 3 concurrent pickers with articulated human worker meshes (hi-vis vest, hard hat, swinging arms/legs synchronized to velocity) pushing AGV carts.
+   - *Aisle Congestion Yielding Engine*: Workers detect higher-priority colleagues within a $1.25\text{ cell}$ radius, entering a yielding state with flashing amber beacons, floating congestion badges, and live telemetry tracking.
+   - *Zero-Cost Raycasting*: Bound `raycast={() => null}` to all building envelopes, walls, and trusses so mouse events pass directly to rack slots with 60 FPS silky smooth performance.
 
 ---
 
@@ -103,7 +109,8 @@ During the development of this project, **Google Antigravity** (Google DeepMind'
 
 - [x] **Data Pipeline**: Cleanly strips 1,429 invalid records, isolates top 100 SKUs, exports 1,367 orders to `orders.json`.
 - [x] **A* Pathfinding**: Strictly adheres to aisles; zero rack clipping; green continuous floor ribbon.
-- [x] **Procedural 3D Scene**: 100 racks, walking aisles, packing dock, and custom animated picker with cargo box stacking.
+- [x] **Procedural 3D Scene**: Spacious architectural white facility on a black void (`#050508`), 100 racks with procedural pallet bases and cardboard textures, walking aisles, and upgraded packing platform.
+- [x] **Multi-Picker Fleet & Congestion**: 1–3 articulated pickers with high-vis vests and cart stacking, $<1.25\text{ cell}$ proximity collision avoidance, yielding state machine, and delay telemetry.
 - [x] **Interactive Game Mode**: Click-to-Swap and one-click presets (**Optimal**, **Randomize**, **Invert**).
 - [x] **Batch Picking & TSP Brain**: Multi-order consolidation with Nearest-Neighbor TSP routing.
 - [x] **Instant Benchmark**: Evaluates all 1,367 orders across Baseline, Custom, and Batched TSP in $<30\text{ ms}$.

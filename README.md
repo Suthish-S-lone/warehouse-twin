@@ -80,13 +80,15 @@ The procedural 3D warehouse floor is configured in [`App.jsx`](file:///c:/nexai-
 | Parameter | Value | Description / Coordinates |
 | :--- | :--- | :--- |
 | **Total Rack Slots** | **100 slots** | 5 double-row bays $\times$ 2 back-to-back columns $\times$ 10 vertical rack slots |
-| **Grid Dimensions** | **$22 \times 16$ cells** | $X \in [0..21]$, $Y \in [0..15]$ (Cell Size = $1.6\text{ m}$) |
-| **Floor Footprint** | **$35.2\text{ m} \times 25.6\text{ m}$** | Total floor surface area: **$901.12\text{ m}^2$** |
+| **Grid Dimensions** | **$22 \times 16$ cells** | $X \in [0..21]$, $Y \in [0..15]$ (Visual Scale Multiplier: `CELL_SIZE = 2.2 m`) |
+| **Floor Footprint** | **$48.4\text{ m} \times 35.2\text{ m}$** | Total floor surface area: **$1,703.68\text{ m}^2$** spacious architectural layout |
 | **Storage Rack Locations** | **10 Columns** | $X \in \{2, 3, 6, 7, 10, 11, 14, 15, 18, 19\}$ spanning $Y \in [3..12]$ |
-| **Vertical Pick Aisles** | **10 Aisles ($1.6\text{ m}$ wide)** | Left pick aisles: $X \in \{1, 5, 9, 13, 17\}$; Right pick aisles: $X \in \{4, 8, 12, 16, 20\}$ |
-| **Cross-Aisles** | **2 Aisles ($1.6\text{ m}$ wide)** | Front cross-aisle at $Y = 2$; Back cross-aisle at $Y = 13$ (safety guide lines) |
+| **Vertical Pick Aisles** | **10 Aisles ($2.2\text{ m}$ wide)** | Left pick aisles: $X \in \{1, 5, 9, 13, 17\}$; Right pick aisles: $X \in \{4, 8, 12, 16, 20\}$ |
+| **Cross-Aisles** | **2 Aisles ($2.2\text{ m}$ wide)** | Front cross-aisle at $Y = 2$; Back cross-aisle at $Y = 13$ (safety guide lines) |
 | **Perimeter Boundary Aisles** | **4 Aisles** | Boundary navigation lanes at $X = 0, 21$ and $Y = 0, 14, 15$ |
-| **Packing Dock Coordinates** | **$(X = 10, Y = 1)$** | Front center origin node adjoining front cross-aisle |
+| **Packing Dock Coordinates** | **$(X = 10, Y = 1)$** | Front center origin node adjoining front cross-aisle with supervisory platform |
+| **Multi-Picker Fleet** | **1 to 3 Pickers** | Articulated human workers (Emerald/Cyan/Amber vests) pushing AGV carts |
+| **Aisle Congestion Engine** | **$1.25\text{ cell}$ proximity** | Yielding state machine, flashing amber beacon, live delay telemetry |
 | **Picker Walking Speed ($v_{\text{walk}}$)** | **$1.2\text{ m/s}$** | Standard human warehouse picker walking velocity used for scoring |
 | **AGV Animation Speed** | **$3.6\text{ m/s}$ base** | Multiplied by user playback speed ($1\times, 5\times, 10\times, 25\times$) |
 | **Pick Handling Time ($t_{\text{pick}}$)** | **$4.0\text{ s}$ per item** | Standard handling time to scan and pick an item from a rack shelf |
